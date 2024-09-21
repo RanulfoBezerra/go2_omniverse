@@ -25,6 +25,31 @@
 import omni
 import omni.graph.core as og
 
+def create_ros2_clock():
+    graph_path = f"/ROS_Clock"
+    og.Controller.edit(
+        {"graph_path": graph_path, 
+         "evaluator_name": "execution",
+         "pipeline_stage": og.GraphPipelineStage.GRAPH_PIPELINE_STAGE_SIMULATION,},
+        {
+            og.Controller.Keys.CREATE_NODES: [
+                ("ReadSimTime", "omni.isaac.core_nodes.IsaacReadSimulationTime"),
+                ("Context", "omni.isaac.ros2_bridge.ROS2Context"),
+                ("PublishClock", "omni.isaac.ros2_bridge.ROS2PublishClock"),
+                ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
+            ],
+            og.Controller.Keys.CONNECT: [
+                ("OnPlaybackTick.outputs:tick", "PublishClock.inputs:execIn"),
+                ("ReadSimTime.outputs:simulationTime", "PublishClock.inputs:timeStamp"),
+                ("Context.outputs:context", "PublishClock.inputs:context"),
+            ],
+            og.Controller.Keys.SET_VALUES: [
+                ("PublishClock.inputs:topicName", "/clock"),
+                ("Context.inputs:domain_id", 0),
+            ],
+        },
+    )
+
 
 def create_front_cam_omnigraph(robot_num):
     """Define the OmniGraph for the Isaac Sim environment."""

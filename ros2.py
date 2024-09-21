@@ -26,7 +26,7 @@ import time
 
 import numpy as np
 
-
+import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile
 from sensor_msgs.msg import JointState
@@ -38,15 +38,51 @@ from std_msgs.msg import Header
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import PointCloud2, PointField, Imu
 from sensor_msgs_py import point_cloud2
+from tf2_msgs.msg import TFMessage
 
 
-
-from omni.isaac.orbit.sensors import CameraCfg, Camera
+from omni.isaac.lab.sensors import CameraCfg, Camera
 from omni.isaac.sensor import LidarRtx
 import omni.replicator.core as rep
 from scipy.spatial.transform import Rotation
-import omni.isaac.orbit.sim as sim_utils
+import omni.isaac.lab.sim as sim_utils
 
+import omni
+from omni.isaac.core import SimulationContext
+# from omni.isaac.core.utils.stage import get_stage
+import omni.graph.core as og
+
+import omni.usd
+
+# def get_stage():
+#     """Retrieve the current USD stage."""
+#     return omni.usd.get_context().get_stage()
+
+from builtin_interfaces.msg import Time
+import math
+
+def float_to_ros_time(float_time):
+    """Convert a float representing seconds to a ROS2 Time message."""
+    ros_time = Time()
+
+    # Split float_time into seconds and nanoseconds
+    ros_time.sec = int(float_time)  # Whole seconds part
+    ros_time.nanosec = int((float_time - ros_time.sec) * 1e9)  # Nanoseconds part
+
+    return ros_time
+
+def get_simulation_time_from_graph():
+    # The path to the simulation time attribute in the graph
+    sim_time_attr_path = "/ROS_Clock/ReadSimTime.outputs:simulationTime"
+
+    # Get the attribute object directly
+    sim_time_value =   og.Controller.attribute(sim_time_attr_path).get() 
+
+    if sim_time_value is None:
+        print("Simulation time attribute not found.")
+        return None
+
+    return float_to_ros_time(sim_time_value)
 
 
 def update_meshes_for_cloud2(position_array, origin, rot):
@@ -146,14 +182,20 @@ def pub_robo_data_ros2(robot_type, num_envs, base_node, env, annotator_lst, star
 
 class RobotBaseNode(Node):
     def __init__(self, num_envs):
-        super().__init__('go2_driver_node')
+        super().__init__(f'go2_driver_node')
         qos_profile = QoSProfile(depth=10)
-
+        # Check if 'use_sim_time' is already declared; if not, declare it
+        if not self.has_parameter('use_sim_time'):
+            self.declare_parameter('use_sim_time', True)
+        else:
+            self.set_parameters([rclpy.parameter.Parameter('use_sim_time', rclpy.Parameter.Type.BOOL, True)])
+        
         self.joint_pub = []
         self.go2_state_pub = []
         self.go2_lidar_pub = []
         self.odom_pub = []
         self.imu_pub = []
+        self.tf_pub = []
 
         for i in range(num_envs):
             self.joint_pub.append(self.create_publisher(JointState, f'robot{i}/joint_states', qos_profile))
@@ -161,12 +203,22 @@ class RobotBaseNode(Node):
             self.go2_lidar_pub.append(self.create_publisher(PointCloud2, f'robot{i}/point_cloud2', qos_profile))
             self.odom_pub.append(self.create_publisher(Odometry, f'robot{i}/odom', qos_profile))
             self.imu_pub.append(self.create_publisher(Imu, f'robot{i}/imu', qos_profile))
-        self.broadcaster= TransformBroadcaster(self, qos=qos_profile)
+            # self.broadcaster= TransformBroadcaster(self, qos=qos_profile)
+            self.tf_pub.append(self.create_publisher(TFMessage, f'robot{i}/tf', qos_profile))
         
+    def check_sim_time(self):
+        # Check if simulation time is available and ready
+        if self.get_clock().now().nanoseconds != 0:
+            self.sim_time_ready = True
+            self.get_logger().info("Simulation time is now available!")
+        else:
+            self.get_logger().info("Waiting for simulation time...")
+
+
     def publish_joints(self, joint_names_lst, joint_state_lst, robot_num):
         # Create message
         joint_state = JointState()
-        joint_state.header.stamp = self.get_clock().now().to_msg()
+        joint_state.header.stamp = get_simulation_time_from_graph() #self.get_clock().now().to_msg()
 
         joint_state_names_formated = []
         for joint_name in joint_names_lst:
@@ -181,10 +233,12 @@ class RobotBaseNode(Node):
         self.joint_pub[robot_num].publish(joint_state)
 
     def publish_odom(self, base_pos, base_rot, robot_num):
+        sim_time = get_simulation_time_from_graph()
+        tf_msg = TFMessage()
         odom_trans = TransformStamped()
-        odom_trans.header.stamp = self.get_clock().now().to_msg()
+        odom_trans.header.stamp = sim_time#self.get_clock().now().to_msg()
         odom_trans.header.frame_id = "odom"
-        odom_trans.child_frame_id = f"robot{robot_num}/base_link"
+        odom_trans.child_frame_id = "base_link"
         odom_trans.transform.translation.x = base_pos[0].item()
         odom_trans.transform.translation.y = base_pos[1].item()
         odom_trans.transform.translation.z = base_pos[2].item()
@@ -192,12 +246,13 @@ class RobotBaseNode(Node):
         odom_trans.transform.rotation.y = base_rot[2].item()
         odom_trans.transform.rotation.z = base_rot[3].item()
         odom_trans.transform.rotation.w = base_rot[0].item()
-        self.broadcaster.sendTransform(odom_trans)
+        tf_msg.transforms.append(odom_trans)
+        self.tf_pub[robot_num].publish(tf_msg)
 
         odom_topic = Odometry()
-        odom_topic.header.stamp = self.get_clock().now().to_msg()
+        odom_topic.header.stamp = sim_time#self.get_clock().now().to_msg()
         odom_topic.header.frame_id = "odom"
-        odom_topic.child_frame_id = f"robot{robot_num}/base_link"
+        odom_topic.child_frame_id = "base_link"
         odom_topic.pose.pose.position.x = base_pos[0].item()
         odom_topic.pose.pose.position.y = base_pos[1].item()
         odom_topic.pose.pose.position.z = base_pos[2].item()
@@ -209,9 +264,10 @@ class RobotBaseNode(Node):
 
 
     def publish_imu(self, base_rot, base_lin_vel, base_ang_vel, robot_num):
+        sim_time = get_simulation_time_from_graph()
         imu_trans = Imu()
-        imu_trans.header.stamp = self.get_clock().now().to_msg()
-        imu_trans.header.frame_id = f"robot{robot_num}/base_link"
+        imu_trans.header.stamp = sim_time#self.get_clock().now().to_msg()
+        imu_trans.header.frame_id = "base_link"
 
         imu_trans.linear_acceleration.x = base_lin_vel[0].item()
         imu_trans.linear_acceleration.y = base_lin_vel[1].item()
@@ -242,7 +298,8 @@ class RobotBaseNode(Node):
     def publish_lidar(self, points, robot_num):
 
         point_cloud = PointCloud2()
-        point_cloud.header = Header(frame_id="odom")
+        point_cloud.header = Header(frame_id="base_link",stamp=get_simulation_time_from_graph())
+        # point_cloud.stamp = get_simulation_time_from_graph()
         fields = [
             PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
             PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
